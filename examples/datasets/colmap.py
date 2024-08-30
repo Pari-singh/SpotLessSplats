@@ -1,11 +1,14 @@
 import os
 from typing import Any, Dict, List, Optional
+from collections import OrderedDict
 
 import cv2
+import json
 import imageio.v2 as imageio
 import numpy as np
 import scipy as sp
 import mediapy as media
+from PIL import Image
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.neighbors import kneighbors_graph
 import torch
@@ -51,6 +54,14 @@ class Parser:
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
 
+        custom_data = False
+        name_map_file = os.path.join(data_dir, 'name_map.json')
+        if os.path.exists(name_map_file):
+            custom_data = True
+            updated_imdata = OrderedDict()
+            with open(name_map_file, 'r') as f:
+                name_map = json.load(f)
+
         manager = SceneManager(colmap_dir)
         manager.load_cameras()
         manager.load_images()
@@ -72,16 +83,20 @@ class Parser:
         if factor > 1:
             image_dir_suffix = f"_{factor}"
             image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
-            if not os.path.exists(image_dir):
+            if not os.path.exists(image_dir) or not len(os.listdir(image_dir)):
                 print("downsampling and saving the images.")
                 downsample = True
-                os.makedirs(image_dir)
+                os.makedirs(image_dir, exist_ok=True)
         else:
             image_dir = colmap_image_dir
 
         for k in imdata:
             im = imdata[k]
-
+            if custom_data:
+                if im.name not in name_map.keys(): continue
+                else:
+                    im.name = name_map[im.name]
+                    updated_imdata[k] = im
             rot = im.R()
             trans = im.tvec.reshape(3, 1)
             w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
@@ -107,7 +122,8 @@ class Parser:
                 params = np.empty(0, dtype=np.float32)
                 camtype = "perspective"
             if type_ == 2 or type_ == "SIMPLE_RADIAL":
-                params = np.array([cam.k1], dtype=np.float32)
+                # params = np.array([cam.k1], dtype=np.float32)
+                params = np.array([cam.k1, 0.0, 0.0, 0.0], dtype=np.float32)
                 camtype = "perspective"
             elif type_ == 3 or type_ == "RADIAL":
                 params = np.array([cam.k1, cam.k2, 0.0, 0.0], dtype=np.float32)
@@ -129,10 +145,15 @@ class Parser:
             if downsample:
                 im_path = os.path.join(colmap_image_dir, im.name)
                 im_rgb = media.read_image(im_path)
-                resize_im = media.resize(im_rgb, imsize_dict[camera_id])
+                im_pil = Image.fromarray(im_rgb)
+                resize_im_pil = im_pil.resize(imsize_dict[camera_id])
+                resize_im = np.array(resize_im_pil)
+                # resize_im = media.resize(im_rgb, imsize_dict[camera_id])
                 out_path = os.path.join(image_dir, im.name)
                 media.write_image(out_path, resize_im)
 
+        if custom_data:
+            imdata = updated_imdata
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
         )
