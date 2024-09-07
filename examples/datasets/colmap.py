@@ -6,6 +6,7 @@ import cv2
 import json
 import imageio.v2 as imageio
 import numpy as np
+import pandas as pd
 import scipy as sp
 import mediapy as media
 from PIL import Image
@@ -409,6 +410,7 @@ class ClutterDataset(Dataset):
         train_keyword: str = "clutter",
         test_keyword: str = "extra",
         semantics: bool = False,
+        client_indices: Optional[list] = [],
     ):
         super().__init__(
             parser,
@@ -416,7 +418,10 @@ class ClutterDataset(Dataset):
             patch_size,
             load_depths,
         )
-        indices = np.arange(len(self.parser.image_names))
+        if len(client_indices):
+            indices = client_indices # Ensure this is a list of indices
+        else:
+            indices = np.arange(len(self.parser.image_names))
         self.semantics = semantics
         if train_keyword == "":
             if split == "train":
