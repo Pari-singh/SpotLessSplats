@@ -1,3 +1,5 @@
+import os
+
 import flwr
 from flwr.server.client_proxy import ClientProxy
 from flwr.common import (
@@ -38,7 +40,26 @@ def get_evaluate_fn():
 
     return evaluate_fn
 
+def weighted_average(metrics_list):
 
+    # Initialize variables to store the sum of weighted metrics and total weights (samples)
+    total_weight = 0
+    aggregated_metrics = {}
+    # Loop over each client's metrics and sample count
+    for weight, metrics in metrics_list:
+        total_weight += weight
+
+        for metric_key, metric_value in metrics.items():
+            if metric_key in aggregated_metrics:
+                aggregated_metrics[metric_key] += metric_value * weight
+            else:
+                aggregated_metrics[metric_key] = metric_value * weight
+
+    if total_weight > 0:
+        for metric_key in aggregated_metrics:
+            aggregated_metrics[metric_key] /= total_weight
+
+    return aggregated_metrics
 class SaveModelStrategy(flwr.server.strategy.FedAvg):
     def aggregate_fit(
             self,
@@ -68,8 +89,10 @@ class SaveModelStrategy(flwr.server.strategy.FedAvg):
             mlp_model.load_state_dict(state_dict, strict=True)
 
             # Save the model
+            server_path = os.path.join(self.cfg.result_dir, "server")
+            os.makedirs(server_path, exist_ok=True)
             torch.save(mlp_model.state_dict(),
-                       f"{self.cfg.result_dir}/server/round_{server_round + (self.cfg.resume_round - 1)}.pth")
+                       f"{server_path}/round_{server_round + (self.cfg.resume_round - 1)}.pth")
 
         return aggregated_parameters, aggregated_metrics
 
@@ -88,47 +111,6 @@ def fit_config(server_round: int) -> Dict[str, Scalar]:
     }
     return config
 
-
-def weighted_average(metrics_list):
-    """
-    Aggregation function for federated evaluation metrics, taking into account the
-    number of samples (or data size) each client contributed during training.
-
-    Args:
-    metrics_list (List[Tuple[Dict[str, float], int]]): List where each element is a tuple containing
-                                                       a dictionary of metrics and the number of training samples
-                                                       used by the client.
-
-    Returns:
-    Dict[str, float]: Dictionary of aggregated metrics.
-    """
-    # Initialize variables to store the sum of weighted metrics and total weights (samples)
-    total_weight = 0
-    aggregated_metrics = {}
-
-    # Loop over each client's metrics and sample count
-    for metrics, weight in metrics_list:
-        # Add to the total weight
-        total_weight += weight
-
-        # Process each metric in the dictionary
-        for metric_key, metric_value in metrics.items():
-            if metric_key in aggregated_metrics:
-                # Accumulate the weighted metric value
-                aggregated_metrics[metric_key] += metric_value * weight
-            else:
-                # Initialize the metric in the dictionary
-                aggregated_metrics[metric_key] = metric_value * weight
-
-    # Normalize the accumulated metrics by the total weight to get the weighted average
-    if total_weight > 0:
-        for metric_key in aggregated_metrics:
-            aggregated_metrics[metric_key] /= total_weight
-    else:
-        # Handle the edge case where total_weight might be zero to avoid division by zero
-        aggregated_metrics = {key: 0 for key in aggregated_metrics}
-
-    return aggregated_metrics
 def choose_strategy(cfg, fit_config, weighted_average,
                     server_model_static_params=None):
     NUM_CLIENTS = cfg.num_clients

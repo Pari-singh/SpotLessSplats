@@ -8,20 +8,17 @@ import imageio
 from typing import Dict, List, Optional, Tuple
 from collections import OrderedDict
 from datasets.traj import generate_interpolated_path, get_ordered_poses
-from flwr.client import Client, ClientApp, NumPyClient
+from flwr.client import NumPyClient
 import torch
 from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from utils import (
-    AppearanceOptModule,
-    CameraOptModule,
     get_positional_encodings,
     knn,
     normalized_quat_to_rotmat,
     rgb_to_sh,
-    set_random_seed,
     SpotLessModule,
 )
 from gsplat.rendering import rasterization
@@ -186,7 +183,18 @@ class GaussianFlowerClient(NumPyClient):
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         metrics = self.eval(return_metric=True)
-        return metrics, len(self.trainset), {}
+        psnr = metrics['PSNR'].item() if 'PSNR' in metrics else 0.0
+        ssim = metrics['SSIM'].item() if 'SSIM' in metrics else 0.0
+        lpips = metrics['LPIPS'].item() if 'LPIPS' in metrics else 0.0
+        num_samples = len(self.trainset)  # Number of samples might be different depending on your setup
+
+        additional_metrics = {
+            "PSNR": psnr,
+            "SSIM": ssim,
+            "LPIPS": lpips,
+        }
+
+        return 0.0, num_samples, additional_metrics
     def train(self):
         with open(f"{self.client_result_dir}/cfg.json", "w") as f:
             json.dump(vars(self.cfg), f)
@@ -579,9 +587,9 @@ class GaussianFlowerClient(NumPyClient):
 
             pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
             colors = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-            metrics["psnr"].append(self.psnr(colors, pixels))
-            metrics["ssim"].append(self.ssim(colors, pixels))
-            metrics["lpips"].append(self.lpips(colors, pixels))
+            metrics["psnr"].append(self.runner.psnr(colors, pixels))
+            metrics["ssim"].append(self.runner.ssim(colors, pixels))
+            metrics["lpips"].append(self.runner.lpips(colors, pixels))
 
         ellipse_time /= len(self.valloader)
 
