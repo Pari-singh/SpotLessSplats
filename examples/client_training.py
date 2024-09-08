@@ -538,6 +538,8 @@ class GaussianFlowerClient(NumPyClient):
                 self.eval(step)
                 self.render_traj(step)
 
+            self.log_memory_usage(step, 'training')
+
             if not self.cfg.disable_viewer:
                 self.runner.viewer.lock.release()
                 num_train_steps_per_sec = 1.0 / (time.time() - tic)
@@ -984,3 +986,7 @@ class GaussianFlowerClient(NumPyClient):
             writer.append_data(canvas)
         writer.close()
         print(f"Video saved to {video_dir}/traj_{step}.gif")
+
+    def log_memory_usage(self, step, context):
+        allocated_memory = torch.cuda.memory_allocated() / (1024 ** 3)  # Convert to GB
+        print(f"[{context}] Step {step}: Allocated memory: {allocated_memory:.3f} GB")
