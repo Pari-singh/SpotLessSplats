@@ -102,20 +102,8 @@ class GaussianFlowerClient(NumPyClient):
         self.valloader = valloader
         self.device = device
 
-        # Where to dump results.
-        self.client_result_dir = os.path.join(cfg.result_dir, f"client_{client_id}")
+        self.client_result_dir = os.path.join(self.cfg.result_dir, f"client_{self.client_id}")
         os.makedirs(self.client_result_dir, exist_ok=True)
-
-        # Setup output directories.
-        self.ckpt_dir = f"{self.client_result_dir}/ckpts"
-        os.makedirs(self.ckpt_dir, exist_ok=True)
-        self.stats_dir = f"{self.client_result_dir}/stats"
-        os.makedirs(self.stats_dir, exist_ok=True)
-        self.render_dir = f"{self.client_result_dir}/renders"
-        os.makedirs(self.render_dir, exist_ok=True)
-
-        # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{self.client_result_dir}/tb")
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -163,6 +151,18 @@ class GaussianFlowerClient(NumPyClient):
             "sqrgrad": torch.zeros(n_gauss, device=self.device),
         }
 
+    def setup_directories(self, round):
+        # Dumping results - one for each round.
+        self.ckpt_dir = f"{self.client_result_dir}/{round}/ckpts"
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        self.stats_dir = f"{self.client_result_dir}/{round}/stats"
+        os.makedirs(self.stats_dir, exist_ok=True)
+        self.render_dir = f"{self.client_result_dir}/{round}/renders"
+        os.makedirs(self.render_dir, exist_ok=True)
+
+        # Tensorboard
+        self.writer = SummaryWriter(log_dir=f"{self.client_result_dir}/{round}/tb")
+
     def get_parameters(self, config=None):
         if config:
             print(f"Recieved {config} from server")
@@ -176,13 +176,18 @@ class GaussianFlowerClient(NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        self.train()
+        print("Starting client training; info from server: ", config)
+
+        round_id = config.get('round', -1)
+        self.train(round_id)
         new_parameters = self.get_parameters()
         return new_parameters, len(self.trainset), {}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
-        metrics = self.eval(return_metric=True)
+        round_id = config.get('round', -1)
+        import pdb; pdb.set_trace()
+        metrics = self.eval(round=round_id, return_metric=True)
         psnr = metrics['PSNR'].item() if 'PSNR' in metrics else 0.0
         ssim = metrics['SSIM'].item() if 'SSIM' in metrics else 0.0
         lpips = metrics['LPIPS'].item() if 'LPIPS' in metrics else 0.0
@@ -195,8 +200,9 @@ class GaussianFlowerClient(NumPyClient):
         }
 
         return 0.0, num_samples, additional_metrics
-    def train(self):
-        with open(f"{self.client_result_dir}/cfg.json", "w") as f:
+    def train(self, round):
+        self.setup_directories(round)
+        with open(f"{self.client_result_dir}/{round}/cfg.json", "w") as f:
             json.dump(vars(self.cfg), f)
 
         max_steps = self.cfg.max_steps
@@ -371,7 +377,7 @@ class GaussianFlowerClient(NumPyClient):
                 range=(0.0, 1.0),
             )[0]
 
-            desc = f"client={self.client_id} | loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"client={self.client_id} | round={round} | loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if self.cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if self.cfg.pose_opt and self.cfg.pose_noise:
@@ -477,7 +483,7 @@ class GaussianFlowerClient(NumPyClient):
                         size=self.splats[k].size(),  # [N, ...]
                         is_coalesced=len(Ks) == 1,
                     )
-
+            print(self.ckpt_dir)
             # optimize
             for optimizer in self.optimizers:
                 optimizer.step()
@@ -535,8 +541,8 @@ class GaussianFlowerClient(NumPyClient):
 
             # eval the full set at the end of entire training
             if step in [i - 1 for i in self.cfg.eval_steps] or step == max_steps - 1:
-                self.eval(step)
-                self.render_traj(step)
+                self.eval(step, round)
+                # self.render_traj(step, round)
 
             self.log_memory_usage(step, 'training')
 
@@ -552,9 +558,10 @@ class GaussianFlowerClient(NumPyClient):
                 self.runner.viewer.update(step, num_train_rays_per_step)
 
     @torch.no_grad()
-    def eval(self, step: int=0, return_metric: bool=False):
+    def eval(self, step: int=0, round: int=0, return_metric: bool=False):
         """Entry for evaluation."""
-        print("Running evaluation...")
+        print("Running evaluation for round: ", round)
+        self.setup_directories(round)
         cfg = self.cfg
         device = self.device
 
@@ -599,6 +606,7 @@ class GaussianFlowerClient(NumPyClient):
         ssim = torch.stack(metrics["ssim"]).mean()
         lpips = torch.stack(metrics["lpips"]).mean()
         print(
+            f"For round: {round} "
             f"PSNR: {psnr.item():.3f}, SSIM: {ssim.item():.4f}, LPIPS: {lpips.item():.3f} "
             f"Time: {ellipse_time:.3f}s/image "
             f"Number of GS: {len(self.splats['means3d'])}"
@@ -620,7 +628,7 @@ class GaussianFlowerClient(NumPyClient):
             self.writer.flush()
         else:
             # returning metrics with list to get weighted avg
-            return {'PSNR':psnr, 'SSIM':ssim, 'LPIPS':lpips}
+            return {'PSNR': psnr, 'SSIM': ssim, 'LPIPS': lpips}
     @torch.no_grad()
     def reset_opa(self, value: float = 0.01):
         """Utility function to reset opacities."""
@@ -931,7 +939,7 @@ class GaussianFlowerClient(NumPyClient):
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    def render_traj(self, step: int):
+    def render_traj(self, step: int, round: int=0):
         """Entry for trajectory rendering."""
         print("Running trajectory rendering...")
         cfg = self.cfg

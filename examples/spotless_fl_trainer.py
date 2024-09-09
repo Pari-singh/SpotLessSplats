@@ -14,27 +14,19 @@ import tqdm
 import tyro
 import viser
 import nerfview
-from datasets.colmap import Dataset, Parser, ClutterDataset, SemanticParser
+from datasets.colmap import Parser, ClutterDataset, SemanticParser
 
 from client_training import GaussianFlowerClient
-from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from utils import (
-    AppearanceOptModule,
-    CameraOptModule,
-    get_positional_encodings,
     knn,
-    normalized_quat_to_rotmat,
     rgb_to_sh,
     set_random_seed,
-    SpotLessModule,
 )
-from gsplat.rendering import rasterization
 
 import flwr
-from flwr.client import Client, ClientApp, NumPyClient
 from fl_utils.fl_strategy import choose_strategy, fit_config, weighted_average
 
 

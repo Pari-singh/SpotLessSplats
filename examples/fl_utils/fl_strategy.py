@@ -103,13 +103,11 @@ class SaveModelStrategy(flwr.server.strategy.FedAvg):
         self.device = cfg.device
 
 def fit_config(server_round: int) -> Dict[str, Scalar]:
-    """Return a configuration with static batch size and (local) epochs."""
-    config = {
-        "round": server_round,
-        "epochs": 1,  # Number of local epochs done by clients
-        # "lr": 0.01,  # Learning rate to use by clients during fit()
-    }
+    config = {"round": server_round}
     return config
+
+def on_evaluate_config(server_round: int) -> Dict[str, Scalar]:
+    return {"round": server_round}
 
 def choose_strategy(cfg, fit_config, weighted_average,
                     server_model_static_params=None):
@@ -124,6 +122,7 @@ def choose_strategy(cfg, fit_config, weighted_average,
                 NUM_CLIENTS * cfg.min_available_clients
             ),
             on_fit_config_fn=fit_config,
+            on_evaluate_config_fn=on_evaluate_config,
             evaluate_metrics_aggregation_fn=weighted_average,
             evaluate_fn=get_evaluate_fn(),
         )

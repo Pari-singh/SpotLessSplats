@@ -33,7 +33,6 @@ from utils import (
 
 from gsplat.rendering import rasterization
 
-
 @dataclass
 class Config:
     # Disable viewer
