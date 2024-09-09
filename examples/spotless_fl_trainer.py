@@ -297,25 +297,6 @@ class Runner:
                 normalize=cfg.normalize,
                 test_every=cfg.test_every,
             )
-        self.trainset = ClutterDataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
-            train_keyword=cfg.train_keyword,
-            test_keyword=cfg.test_keyword,
-            semantics=cfg.semantics,
-        )
-        self.valset = ClutterDataset(
-            self.parser,
-            split="test",
-            train_keyword=cfg.train_keyword,
-            test_keyword=cfg.test_keyword,
-            semantics=False,
-        )
-        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
-        print("Scene scale:", self.scene_scale)
-        cfg.mlp_spotless_num_feats = self.trainset[0]["semantics"].shape[0] + 80
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -420,7 +401,27 @@ def main(cfg: Config):
     print("Number of clients: ", NUM_CLIENTS)
 
     runner = Runner(cfg)
-    valset = runner.valset
+
+    trainset = ClutterDataset(
+        runner.parser,
+        split="train",
+        patch_size=cfg.patch_size,
+        load_depths=cfg.depth_loss,
+        train_keyword=cfg.train_keyword,
+        test_keyword=cfg.test_keyword,
+        semantics=cfg.semantics,
+    )
+    valset = ClutterDataset(
+        runner.parser,
+        split="test",
+        train_keyword=cfg.train_keyword,
+        test_keyword=cfg.test_keyword,
+        semantics=False,
+    )
+    cfg.scene_scale = runner.parser.scene_scale * 1.1 * cfg.global_scale
+    print("Scene scale:", cfg.scene_scale)
+    cfg.mlp_spotless_num_feats = trainset[0]["semantics"].shape[0] + 80
+
     val_dataloader = torch.utils.data.DataLoader(valset, batch_size=1, shuffle=False)
 
     # load the split from tsv file
@@ -429,7 +430,7 @@ def main(cfg: Config):
     # Create dataset for each client
     train_datasets = {}
     for client_id, image_names in client_splits.items():
-        indices = map_image_names_to_indices(runner.trainset, image_names)
+        indices = map_image_names_to_indices(trainset, image_names)
         train_datasets[client_id] = ClutterDataset(
             runner.parser,
             split="train",
