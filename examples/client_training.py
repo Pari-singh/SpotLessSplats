@@ -355,7 +355,7 @@ class GaussianFlowerClient(NumPyClient):
                 # calculate loss in disparity space
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.runner.scene_scale
+                depthloss = F.l1_loss(disp, disp_gt) * self.cfg.scene_scale
                 loss += depthloss * self.cfg.depth_lambda
 
             loss.backward()
@@ -415,7 +415,7 @@ class GaussianFlowerClient(NumPyClient):
                     is_grad_high = grads >= self.cfg.grow_grad2d
                     is_small = (
                             torch.exp(self.splats["scales"]).max(dim=-1).values
-                            <= self.cfg.grow_scale3d * self.runner.scene_scale
+                            <= self.cfg.grow_scale3d * self.cfg.scene_scale
                     )
                     is_dupli = is_grad_high & is_small
                     n_dupli = is_dupli.sum().item()
@@ -444,7 +444,7 @@ class GaussianFlowerClient(NumPyClient):
                         # https://github.com/graphdeco-inria/gaussian-splatting/issues/123
                         is_too_big = (
                                 torch.exp(self.splats["scales"]).max(dim=-1).values
-                                > self.cfg.prune_scale3d * self.runner.scene_scale
+                                > self.cfg.prune_scale3d * self.cfg.scene_scale
                         )
                         is_prune = is_prune | is_too_big
                         if self.cfg.ubp:
