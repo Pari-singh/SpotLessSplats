@@ -33,7 +33,6 @@ from utils import (
 
 from gsplat.rendering import rasterization
 
-
 @dataclass
 class Config:
     # Disable viewer
@@ -607,7 +606,7 @@ class Runner:
                     error_per_pixel, self.running_stats["avg_err"]
                 )
                 if cfg.semantics:
-                    sf = data["semantics"].to(device)
+                    sf = data["semantics"].to(device) # SD feature extracted
                     if cfg.cluster:
                         # cluster the semantic feature and mask based on cluster voting
                         sf = nn.Upsample(
@@ -858,6 +857,8 @@ class Runner:
                 self.eval(step)
                 self.render_traj(step)
 
+            self.log_memory_usage(step, 'training')
+
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
                 num_train_steps_per_sec = 1.0 / (time.time() - tic)
@@ -868,6 +869,7 @@ class Runner:
                 self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
 
     @torch.no_grad()
     def update_running_stats(self, info: Dict):
@@ -1239,6 +1241,10 @@ class Runner:
             radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()
+
+    def log_memory_usage(self, step, context):
+        allocated_memory = torch.cuda.memory_allocated() / (1024 ** 3)  # Convert to GB
+        print(f"[{context}] Step {step}: Allocated memory: {allocated_memory:.3f} GB")
 
 
 def main(cfg: Config):
