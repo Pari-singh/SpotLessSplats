@@ -219,9 +219,10 @@ class GaussianFlowerClient(NumPyClient):
             batch_size=self.cfg.batch_size,
             shuffle=True,
             num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
+            persistent_workers=False, # True, Experimental - memory efficiency optimization
+            pin_memory=False, # True, Experimental - memory efficiency optimization
         )
+
         trainloader_iter = iter(trainloader)
 
         # Training loop.
@@ -368,6 +369,10 @@ class GaussianFlowerClient(NumPyClient):
                 reg = 0.5 * self.spotless_module.get_regularizer()
                 spot_loss = spot_loss + reg
                 spot_loss.backward()
+
+            # Experimental - memory efficiency optimization
+            del renders, alphas, colors, depths
+            torch.cuda.empty_cache()
 
             # Pass the error histogram for capturing error statistics
             info["err"] = torch.histogram(
