@@ -368,7 +368,6 @@ class Runner:
         self.spotless_optimizers = []
         self.mlp_spotless = cfg.semantics and not cfg.cluster
         if self.mlp_spotless:
-            import pdb; pdb.set_trace()
             # currently using positional encoding of order 20 (4*20 = 80)
             self.spotless_module = SpotLessModule(
                 num_classes=1, num_features=self.trainset[0]["semantics"].shape[0] + 80
@@ -607,7 +606,6 @@ class Runner:
                     error_per_pixel, self.running_stats["avg_err"]
                 )
                 if cfg.semantics:
-                    import pdb; pdb.set_trace()
                     sf = data["semantics"].to(device) # SD feature extracted
                     if cfg.cluster:
                         # cluster the semantic feature and mask based on cluster voting

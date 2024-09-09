@@ -186,7 +186,6 @@ class GaussianFlowerClient(NumPyClient):
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         round_id = config.get('round', -1)
-        import pdb; pdb.set_trace()
         metrics = self.eval(round=round_id, return_metric=True)
         psnr = metrics['PSNR'].item() if 'PSNR' in metrics else 0.0
         ssim = metrics['SSIM'].item() if 'SSIM' in metrics else 0.0
