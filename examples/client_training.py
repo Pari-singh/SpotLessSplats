@@ -114,7 +114,7 @@ class GaussianFlowerClient(NumPyClient):
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
-            scene_scale=self.runner.scene_scale,
+            scene_scale=self.cfg.scene_scale,
             sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
             batch_size=cfg.batch_size,
