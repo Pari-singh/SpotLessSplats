@@ -370,16 +370,16 @@ class GaussianFlowerClient(NumPyClient):
                 spot_loss = spot_loss + reg
                 spot_loss.backward()
 
-            # Experimental - memory efficiency optimization
-            del renders, alphas, colors, depths
-            torch.cuda.empty_cache()
-
             # Pass the error histogram for capturing error statistics
             info["err"] = torch.histogram(
                 torch.mean(torch.abs(colors - pixels), dim=-3).clone().detach().cpu(),
                 bins=self.cfg.bin_size,
                 range=(0.0, 1.0),
             )[0]
+
+            # Experimental - memory efficiency optimization
+            del renders, alphas, colors, depths
+            torch.cuda.empty_cache()
 
             desc = f"client={self.client_id} | round={round} | loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if self.cfg.depth_loss:
