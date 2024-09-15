@@ -186,7 +186,7 @@ class Config:
     num_clients: int = 1 #8
     client_split_path: str = "/media/big_data/fed3dgs/sofa_people/spotless_sofa_people/decent_split.tsv"
     num_cpus_per_client: int = 8
-    frac_gpus_per_client: int = 1
+    frac_gpus_per_client: float = 0.5
     num_rounds: int = 10
     resume_round: int = 1
     mlp_spotless_num_feats: int = 0
