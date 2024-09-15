@@ -23,6 +23,7 @@ from utils import (
 )
 from gsplat.rendering import rasterization
 from datasets.colmap import Parser
+from torch.profiler import profile, ProfilerActivity
 
 def create_splats_with_optimizers(
     parser: Parser,
@@ -102,20 +103,8 @@ class GaussianFlowerClient(NumPyClient):
         self.valloader = valloader
         self.device = device
 
-        # Where to dump results.
-        self.client_result_dir = os.path.join(cfg.result_dir, f"client_{client_id}")
+        self.client_result_dir = os.path.join(self.cfg.result_dir, f"client_{self.client_id}")
         os.makedirs(self.client_result_dir, exist_ok=True)
-
-        # Setup output directories.
-        self.ckpt_dir = f"{self.client_result_dir}/ckpts"
-        os.makedirs(self.ckpt_dir, exist_ok=True)
-        self.stats_dir = f"{self.client_result_dir}/stats"
-        os.makedirs(self.stats_dir, exist_ok=True)
-        self.render_dir = f"{self.client_result_dir}/renders"
-        os.makedirs(self.render_dir, exist_ok=True)
-
-        # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{self.client_result_dir}/tb")
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -126,7 +115,7 @@ class GaussianFlowerClient(NumPyClient):
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
-            scene_scale=self.runner.scene_scale,
+            scene_scale=self.cfg.scene_scale,
             sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
             batch_size=cfg.batch_size,
@@ -163,6 +152,18 @@ class GaussianFlowerClient(NumPyClient):
             "sqrgrad": torch.zeros(n_gauss, device=self.device),
         }
 
+    def setup_directories(self, round):
+        # Dumping results - one for each round.
+        self.ckpt_dir = f"{self.client_result_dir}/{round}/ckpts"
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        self.stats_dir = f"{self.client_result_dir}/{round}/stats"
+        os.makedirs(self.stats_dir, exist_ok=True)
+        self.render_dir = f"{self.client_result_dir}/{round}/renders"
+        os.makedirs(self.render_dir, exist_ok=True)
+
+        # Tensorboard
+        self.writer = SummaryWriter(log_dir=f"{self.client_result_dir}/{round}/tb")
+
     def get_parameters(self, config=None):
         if config:
             print(f"Recieved {config} from server")
@@ -176,13 +177,17 @@ class GaussianFlowerClient(NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        self.train()
+        print("Starting client training; info from server: ", config)
+
+        round_id = config.get('round', -1)
+        self.train(round_id)
         new_parameters = self.get_parameters()
         return new_parameters, len(self.trainset), {}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
-        metrics = self.eval(return_metric=True)
+        round_id = config.get('round', -1)
+        metrics = self.eval(round=round_id, return_metric=True)
         psnr = metrics['PSNR'].item() if 'PSNR' in metrics else 0.0
         ssim = metrics['SSIM'].item() if 'SSIM' in metrics else 0.0
         lpips = metrics['LPIPS'].item() if 'LPIPS' in metrics else 0.0
@@ -195,8 +200,9 @@ class GaussianFlowerClient(NumPyClient):
         }
 
         return 0.0, num_samples, additional_metrics
-    def train(self):
-        with open(f"{self.client_result_dir}/cfg.json", "w") as f:
+    def train(self, round):
+        self.setup_directories(round)
+        with open(f"{self.client_result_dir}/{round}/cfg.json", "w") as f:
             json.dump(vars(self.cfg), f)
 
         max_steps = self.cfg.max_steps
@@ -214,15 +220,18 @@ class GaussianFlowerClient(NumPyClient):
             batch_size=self.cfg.batch_size,
             shuffle=True,
             num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
+            persistent_workers=False, # True, Experimental - memory efficiency optimization
+            pin_memory=False, # True, Experimental - memory efficiency optimization
         )
+
         trainloader_iter = iter(trainloader)
 
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
-
+        # Wrap the training loop with the profiler
+        # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True,
+        #              record_shapes=True) as prof:
         for step in pbar:
             if not self.cfg.disable_viewer:
                 while self.runner.viewer.state.status == "paused":
@@ -350,7 +359,7 @@ class GaussianFlowerClient(NumPyClient):
                 # calculate loss in disparity space
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.runner.scene_scale
+                depthloss = F.l1_loss(disp, disp_gt) * self.cfg.scene_scale
                 loss += depthloss * self.cfg.depth_lambda
 
             loss.backward()
@@ -371,7 +380,7 @@ class GaussianFlowerClient(NumPyClient):
                 range=(0.0, 1.0),
             )[0]
 
-            desc = f"client={self.client_id} | loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"client={self.client_id} | round={round} | loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if self.cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if self.cfg.pose_opt and self.cfg.pose_noise:
@@ -400,7 +409,7 @@ class GaussianFlowerClient(NumPyClient):
             # update running stats for prunning & growing
             if step < self.cfg.refine_stop_iter:
                 self.update_running_stats(info)
-                
+
                 if step > self.cfg.refine_start_iter and step % self.cfg.refine_every == 0:
                     grads = self.running_stats["grad2d"] / self.running_stats[
                         "count"
@@ -410,7 +419,7 @@ class GaussianFlowerClient(NumPyClient):
                     is_grad_high = grads >= self.cfg.grow_grad2d
                     is_small = (
                             torch.exp(self.splats["scales"]).max(dim=-1).values
-                            <= self.cfg.grow_scale3d * self.runner.scene_scale
+                            <= self.cfg.grow_scale3d * self.cfg.scene_scale
                     )
                     is_dupli = is_grad_high & is_small
                     n_dupli = is_dupli.sum().item()
@@ -439,22 +448,21 @@ class GaussianFlowerClient(NumPyClient):
                         # https://github.com/graphdeco-inria/gaussian-splatting/issues/123
                         is_too_big = (
                                 torch.exp(self.splats["scales"]).max(dim=-1).values
-                                > self.cfg.prune_scale3d * self.runner.scene_scale
+                                > self.cfg.prune_scale3d * self.cfg.scene_scale
                         )
                         is_prune = is_prune | is_too_big
-                        if self.cfg.ubp:
-                            not_utilized = self.running_stats["sqrgrad"] < self.cfg.ubp_thresh
-                            is_prune = is_prune | not_utilized
-                            dis_prune = is_prune | not_utilized
-                        n_prune = is_prune.sum().item()
-                        self.refine_keep(~is_prune)
-                        print(
-                            f"Step {step}: {n_prune} GSs pruned. "
-                            f"Now having {len(self.splats['means3d'])} GSs."
-                        )
+                    if self.cfg.ubp:
+                        not_utilized = self.running_stats["sqrgrad"] < self.cfg.ubp_thresh
+                        is_prune = is_prune | not_utilized
+                    n_prune = is_prune.sum().item()
+                    self.refine_keep(~is_prune)
+                    print(
+                        f"Step {step}: {n_prune} GSs pruned. "
+                        f"Now having {len(self.splats['means3d'])} GSs."
+                    )
 
-                        # reset running stats
-                        self.running_stats["grad2d"].zero_()
+                    # reset running stats
+                    self.running_stats["grad2d"].zero_()
                     if self.cfg.ubp:
                         self.running_stats["sqrgrad"].zero_()
                     self.running_stats["count"].zero_()
@@ -477,7 +485,7 @@ class GaussianFlowerClient(NumPyClient):
                         size=self.splats[k].size(),  # [N, ...]
                         is_coalesced=len(Ks) == 1,
                     )
-
+            print(self.ckpt_dir)
             # optimize
             for optimizer in self.optimizers:
                 optimizer.step()
@@ -535,8 +543,14 @@ class GaussianFlowerClient(NumPyClient):
 
             # eval the full set at the end of entire training
             if step in [i - 1 for i in self.cfg.eval_steps] or step == max_steps - 1:
-                self.eval(step)
-                self.render_traj(step)
+                self.eval(step, round)
+                # self.render_traj(step, round)
+
+            # Experimental - memory efficiency optimization
+            del renders, alphas, colors, depths
+            torch.cuda.empty_cache()
+
+            self.log_memory_usage(step, 'training')
 
             if not self.cfg.disable_viewer:
                 self.runner.viewer.lock.release()
@@ -548,11 +562,14 @@ class GaussianFlowerClient(NumPyClient):
                 self.runner.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                 # Update the scene.
                 self.runner.viewer.update(step, num_train_rays_per_step)
+            # After the loop, print profiling results
+            # print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
 
     @torch.no_grad()
-    def eval(self, step: int=0, return_metric: bool=False):
+    def eval(self, step: int=0, round: int=0, return_metric: bool=False):
         """Entry for evaluation."""
-        print("Running evaluation...")
+        print("Running evaluation for round: ", round)
+        self.setup_directories(round)
         cfg = self.cfg
         device = self.device
 
@@ -597,6 +614,7 @@ class GaussianFlowerClient(NumPyClient):
         ssim = torch.stack(metrics["ssim"]).mean()
         lpips = torch.stack(metrics["lpips"]).mean()
         print(
+            f"For round: {round} "
             f"PSNR: {psnr.item():.3f}, SSIM: {ssim.item():.4f}, LPIPS: {lpips.item():.3f} "
             f"Time: {ellipse_time:.3f}s/image "
             f"Number of GS: {len(self.splats['means3d'])}"
@@ -617,8 +635,9 @@ class GaussianFlowerClient(NumPyClient):
                 self.writer.add_scalar(f"val/{k}", v, step)
             self.writer.flush()
         else:
+            self.writer.flush()
             # returning metrics with list to get weighted avg
-            return {'PSNR':psnr, 'SSIM':ssim, 'LPIPS':lpips}
+            return {'PSNR': psnr, 'SSIM': ssim, 'LPIPS': lpips}
     @torch.no_grad()
     def reset_opa(self, value: float = 0.01):
         """Utility function to reset opacities."""
@@ -929,7 +948,7 @@ class GaussianFlowerClient(NumPyClient):
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    def render_traj(self, step: int):
+    def render_traj(self, step: int, round: int=0):
         """Entry for trajectory rendering."""
         print("Running trajectory rendering...")
         cfg = self.cfg
@@ -984,3 +1003,7 @@ class GaussianFlowerClient(NumPyClient):
             writer.append_data(canvas)
         writer.close()
         print(f"Video saved to {video_dir}/traj_{step}.gif")
+
+    def log_memory_usage(self, step, context):
+        allocated_memory = torch.cuda.memory_allocated() / (1024 ** 3)  # Convert to GB
+        print(f"[{context}] Step {step}: Allocated memory: {allocated_memory:.3f} GB")
