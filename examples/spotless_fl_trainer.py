@@ -175,7 +175,7 @@ class Config:
 
     # Federated Clients config
     exp_name: str = "debug_1"
-    num_clients: int = 1 #8
+    num_clients: int = 3
     client_split_path: str = "/media/big_data/fed3dgs/sofa_people/spotless_sofa_people/decent_split.tsv"
     num_cpus_per_client: int = 8
     frac_gpus_per_client: float = 0.5
@@ -257,10 +257,6 @@ def create_splats_with_optimizers(
         params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-    # Scale learning rate based on batch size, reference:
-    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
-    # Note that this would not make the training exactly equivalent, see
-    # https://arxiv.org/pdf/2402.18824v1
     optimizers = [
         (torch.optim.SparseAdam if sparse_grad else torch.optim.Adam)(
             [{"params": splats[name], "lr": lr * math.sqrt(batch_size), "name": name}],
@@ -386,10 +382,10 @@ def load_client_splits(tsv_path):
             client_images[client_id] = [image_names]
     return client_images
 
-def generate_client_fn(cfg, trainset, val_loader, runner):
+def generate_client_fn(cfg, trainset, val_loader, runner, splats, optimizers):
     def client_fn(cid: str):
         return GaussianFlowerClient(
-            int(cid), trainset[int(cid)], val_loader, cfg, runner)
+            int(cid), trainset[int(cid)], val_loader, cfg, runner, splats, optimizers)
     return client_fn
 
 def map_image_names_to_indices(dataset, image_names):
@@ -422,6 +418,24 @@ def main(cfg: Config):
     print("Scene scale:", cfg.scene_scale)
     cfg.mlp_spotless_num_feats = trainset[0]["semantics"].shape[0] + 80
 
+    # Model
+    feature_dim = 32 if cfg.app_opt else None
+    splats, optimizers = create_splats_with_optimizers(
+        runner.parser,
+        init_type=cfg.init_type,
+        init_num_pts=cfg.init_num_pts,
+        init_extent=cfg.init_extent,
+        init_opacity=cfg.init_opa,
+        init_scale=cfg.init_scale,
+        scene_scale=cfg.scene_scale,
+        sh_degree=cfg.sh_degree,
+        sparse_grad=cfg.sparse_grad,
+        batch_size=cfg.batch_size,
+        feature_dim=feature_dim,
+        device=cfg.device,
+    )
+    print("Model initialized. Number of GS:", len(splats["means3d"]))
+
     val_dataloader = torch.utils.data.DataLoader(valset, batch_size=1, shuffle=False)
 
     # load the split from tsv file
@@ -442,7 +456,7 @@ def main(cfg: Config):
             client_indices=indices  # Directly passing indices here
         )
 
-    client_fn_callback = generate_client_fn(cfg, train_datasets, val_dataloader, runner)
+    client_fn_callback = generate_client_fn(cfg, train_datasets, val_dataloader, runner, splats, optimizers)
     client_resources = {"num_cpus": cfg.num_cpus_per_client,
                         "num_gpus": cfg.frac_gpus_per_client}
 
@@ -463,7 +477,7 @@ def main(cfg: Config):
     # TODO: Change the strategy acc
     strategy = choose_strategy(cfg, fit_config, weighted_average,
                                server_model_static_params)
-    strategy.init_central_params(cfg)
+    # strategy.init_central_params(cfg)
 
     history = flwr.simulation.start_simulation(
         client_fn=client_fn_callback,  # a callback to construct a client

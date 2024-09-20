@@ -69,38 +69,70 @@ class SaveModelStrategy(flwr.server.strategy.FedAvg):
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
         """Aggregate model weights using weighted average and store checkpoint"""
 
-        # Call aggregate_fit from base class (FedAvg) to aggregate parameters and metrics
-        aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
+        if failures:
+            print(f"Round {server_round} had failures: {failures}")
 
-        if aggregated_parameters is not None:
-            print(f"Saving round {server_round} aggregated_parameters...")
+        # Collect positions from all clients
+        positions_list = [parameters[0] for _, parameters, _, _ in results]
 
-            # Convert `Parameters` to `List[np.ndarray]`
-            aggregated_ndarrays: List[np.ndarray] = flwr.common.parameters_to_ndarrays(aggregated_parameters)
-            mlp_model = None
-            if self.mlp_spotless:
-                mlp_model = SpotLessModule(
-                    num_classes=1, num_features=self.mlp_spotless_num_feats
-                ).cuda()
+        # Identify common positions
+        positions_to_keep = self.identify_common_positions(positions_list)
 
-            # Convert `List[np.ndarray]` to PyTorch`state_dict`
-            params_dict = zip(mlp_model.state_dict().keys(), aggregated_ndarrays)
-            state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-            mlp_model.load_state_dict(state_dict, strict=True)
+        # Send back positions to keep to all clients
+        return [positions_to_keep], {}
 
-            # Save the model
-            server_path = os.path.join(self.cfg.result_dir, "server")
-            os.makedirs(server_path, exist_ok=True)
-            torch.save(mlp_model.state_dict(),
-                       f"{server_path}/round_{server_round + (self.cfg.resume_round - 1)}.pth")
+    def identify_common_positions(self, positions_list):
+        num_clients = len(positions_list)
+        tolerance = 1e-5  # Adjust as needed
+        desired_num_voxels_per_axis = 50  # Adjust based on desired resolution
 
-        return aggregated_parameters, aggregated_metrics
+        # Compute dynamic voxel size
+        all_positions = np.vstack(positions_list)
+        min_coords = np.min(all_positions, axis=0)
+        max_coords = np.max(all_positions, axis=0)
+        bbox_size = max_coords - min_coords
+        voxel_size = bbox_size / desired_num_voxels_per_axis
+        voxel_size = np.mean(voxel_size)
 
-    def init_central_params(self, cfg):
-        self.cfg = cfg
-        self.mlp_spotless = cfg.semantics and not cfg.cluster
-        self.mlp_spotless_num_feats = cfg.mlp_spotless_num_feats
-        self.device = cfg.device
+        # Prepare data structures
+        voxel_positions = defaultdict(lambda: defaultdict(list))  # {voxel_idx: {client_id: [positions]}}
+
+        # Populate voxel_positions
+        for client_id, positions in enumerate(positions_list):
+            for pos in positions:
+                voxel_idx = tuple(np.floor_divide(pos, voxel_size).astype(int))
+                voxel_positions[voxel_idx][client_id].append(pos)
+
+        # Identify positions to keep for each client
+        client_positions_to_keep = {client_id: [] for client_id in range(len(positions_list))}
+
+        for voxel_idx, client_pos_dict in voxel_positions.items():
+            # Only consider voxels where all clients have positions
+            if len(client_pos_dict) == num_clients:
+                # For each client, collect positions in this voxel
+                positions_per_client = {cid: np.array(pos_list) for cid, pos_list in client_pos_dict.items()}
+                # For each client, identify positions that have matches in other clients
+                for client_id in positions_list.keys():
+                    own_positions = positions_per_client[client_id]
+                    other_clients = [cid for cid in range(len(positions_list)) if cid != client_id]
+                    # For each of own positions, check if there's a matching position in other clients
+                    for pos in own_positions:
+                        match = True
+                        for other_client_id in other_clients:
+                            other_positions = positions_per_client[other_client_id]
+                            distances = np.linalg.norm(other_positions - pos, axis=1)
+                            if not np.any(distances <= tolerance):
+                                match = False
+                                break
+                        if match:
+                            client_positions_to_keep[client_id].append(pos)
+
+            # Convert lists to numpy arrays
+        for client_id in client_positions_to_keep:
+            client_positions_to_keep[client_id] = np.array(client_positions_to_keep[client_id])
+
+        return client_positions_to_keep
+
 
 def fit_config(server_round: int) -> Dict[str, Scalar]:
     config = {"round": server_round}

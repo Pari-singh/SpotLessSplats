@@ -1,3 +1,4 @@
+import copy
 import os
 import json
 import time
@@ -23,106 +24,23 @@ from utils import (
 )
 from gsplat.rendering import rasterization
 from datasets.colmap import Parser
-from torch.profiler import profile, ProfilerActivity
-
-def create_splats_with_optimizers(
-    parser: Parser,
-    init_type: str = "sfm",
-    init_num_pts: int = 100_000,
-    init_extent: float = 3.0,
-    init_opacity: float = 0.1,
-    init_scale: float = 1.0,
-    scene_scale: float = 1.0,
-    sh_degree: int = 3,
-    sparse_grad: bool = False,
-    batch_size: int = 1,
-    feature_dim: Optional[int] = None,
-    device: str = "cuda",
-) -> Tuple[torch.nn.ParameterDict, torch.optim.Optimizer]:
-    if init_type == "sfm":
-        points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-    elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-        rgbs = torch.rand((init_num_pts, 3))
-    else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
-
-    N = points.shape[0]
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
-
-    params = [
-        # name, value, lr
-        ("means3d", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
-        ("scales", torch.nn.Parameter(scales), 5e-3),
-        ("quats", torch.nn.Parameter(quats), 1e-3),
-        ("opacities", torch.nn.Parameter(opacities), 5e-2),
-    ]
-
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), 2.5e-3))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
-
-    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-    # Scale learning rate based on batch size, reference:
-    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
-    # Note that this would not make the training exactly equivalent, see
-    # https://arxiv.org/pdf/2402.18824v1
-    optimizers = [
-        (torch.optim.SparseAdam if sparse_grad else torch.optim.Adam)(
-            [{"params": splats[name], "lr": lr * math.sqrt(batch_size), "name": name}],
-            eps=1e-15 / math.sqrt(batch_size),
-            betas=(1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.999)),
-        )
-        for name, _, lr in params
-    ]
-    return splats, optimizers
 
 
 class GaussianFlowerClient(NumPyClient):
-    def __init__(self, client_id, trainset, valloader, cfg, runner, device="cuda"):
+    def __init__(self, client_id, trainset, valloader, cfg, runner, splats, optimizers, device="cuda"):
         super().__init__()
         self.client_id = client_id
         self.cfg = cfg
         self.runner = runner
+        self.splats = copy.deepcopy(splats)
+        self.optimizers = copy.deepcopy(optimizers)
         self.trainset = trainset
         self.valloader = valloader
         self.device = device
+        self.tolerance = 1e-5  #Adjust this - hyperparam
 
         self.client_result_dir = os.path.join(self.cfg.result_dir, f"client_{self.client_id}")
         os.makedirs(self.client_result_dir, exist_ok=True)
-
-        # Model
-        feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers = create_splats_with_optimizers(
-            self.runner.parser,
-            init_type=cfg.init_type,
-            init_num_pts=cfg.init_num_pts,
-            init_extent=cfg.init_extent,
-            init_opacity=cfg.init_opa,
-            init_scale=cfg.init_scale,
-            scene_scale=self.cfg.scene_scale,
-            sh_degree=cfg.sh_degree,
-            sparse_grad=cfg.sparse_grad,
-            batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
-            device=self.device,
-        )
-        print("Model initialized. Number of GS:", len(self.splats["means3d"]))
 
         self.spotless_optimizers = []
         self.mlp_spotless = cfg.semantics and not cfg.cluster
@@ -167,13 +85,13 @@ class GaussianFlowerClient(NumPyClient):
     def get_parameters(self, config=None):
         if config:
             print(f"Recieved {config} from server")
-        # Return the model parameters from the client to server
-        return [param.cpu().numpy() for _, param in self.spotless_module.state_dict().items()]
+        gaussian_positions = self.extract_gaussian_positions()
+        return [gaussian_positions]
 
-    def set_parameters(self, parameters: List[np.ndarray]):
-        params_dict = zip(self.spotless_module.state_dict().keys(), parameters)
-        state_dict = OrderedDict({k: torch.Tensor(v) for k, v in params_dict})
-        self.spotless_module.load_state_dict(state_dict, strict=True)
+    def set_parameters(self, parameters):
+        if parameters:
+            positions_to_keep = parameters[0]
+            self.update_model(positions_to_keep)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
@@ -200,6 +118,45 @@ class GaussianFlowerClient(NumPyClient):
         }
 
         return 0.0, num_samples, additional_metrics
+
+    def extract_gaussian_positions(self):
+        # Extract the positions (x, y, z) from your model's Gaussian splats
+        gaussians_pos = self.splats['means3d']  # Shape: (N, 3)
+        positions = gaussians_pos.detach().cpu().numpy()
+        return positions
+
+    def update_model(self, positions_to_keep):
+        positions_to_keep = torch.tensor(positions_to_keep, device=self.device) # Convert positions to torch tensor
+
+        # Update model's splats by keeping only the positions that match
+        # Get the current positions
+        current_positions = self.splats['means3d']  # Shape: (N, 3)
+        # For each current position, check if it's in positions_to_keep within a tolerance
+        mask = self.get_positions_mask(current_positions, positions_to_keep)
+
+        # Keep only the splats whose positions are in positions_to_keep
+        self.filter_splats(mask)
+
+    def get_positions_mask(self, current_positions, positions_to_keep):
+        """
+        Args:
+            current_positions: Tensor of shape (N, 3)
+            positions_to_keep: Tensor of shape (M, 3)
+
+        Returns:
+            boolean mask of shape (N,) indicating which positions to keep
+        """
+        # Compute pairwise distances between current positions and positions to keep
+        distances = torch.cdist(current_positions, positions_to_keep)
+        # For each current position, check if there's any position to keep within the tolerance
+        min_distances, _ = torch.min(distances, dim=1)
+        mask = min_distances <= self.tolerance
+        return mask
+
+    def filter_splats(self, mask):
+        for key in self.splats:
+            self.splats[key] = self.splats[key][mask]
+
     def train(self, round):
         self.setup_directories(round)
         with open(f"{self.client_result_dir}/{round}/cfg.json", "w") as f:
