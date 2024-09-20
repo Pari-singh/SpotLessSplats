@@ -369,9 +369,14 @@ class Runner:
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()
 
-def load_client_splits(tsv_path):
+def load_client_splits(split_path):
     import pandas as pd
-    client_splits = pd.read_csv(tsv_path, sep='\t')
+    from pathlib import Path
+    extension = Path(split_path).suffix
+    if extension == ".csv":
+        client_splits = pd.read_csv(split_path, index_col=None, header=0)
+    else:
+        client_splits = pd.read_csv(split_path, sep='\t')
     client_images = {}
     for index, row in client_splits.iterrows():
         client_id = row['client_id']
