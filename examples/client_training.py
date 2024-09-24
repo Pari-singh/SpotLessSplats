@@ -9,7 +9,7 @@ import imageio
 from typing import Dict, List, Optional, Tuple
 from collections import OrderedDict
 from datasets.traj import generate_interpolated_path, get_ordered_poses
-from flwr.client import NumPyClient
+from flwr.client import Client, NumPyClient
 import torch
 from torch import Tensor
 import torch.nn as nn
@@ -23,7 +23,7 @@ from utils import (
     SpotLessModule,
 )
 from gsplat.rendering import rasterization
-from datasets.colmap import Parser
+from flwr.common import parameters_to_ndarrays, ndarrays_to_parameters
 
 
 class GaussianFlowerClient(NumPyClient):
@@ -82,13 +82,18 @@ class GaussianFlowerClient(NumPyClient):
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{self.client_result_dir}/{round}/tb")
 
-    def get_parameters(self, config=None):
-        if config:
-            print(f"Recieved {config} from server")
+    def get_parameters(self, config=None) -> List[np.ndarray]:
+        """Return model parameters as a list of NumPy arrays."""
         gaussian_positions = self.extract_gaussian_positions()
-        return [gaussian_positions]
 
-    def set_parameters(self, parameters):
+        # Ensure it's a list of NumPy arrays
+        if not isinstance(gaussian_positions, list):
+            gaussian_positions = [gaussian_positions]
+
+        return gaussian_positions
+
+    def set_parameters(self, parameters: List[np.ndarray]) -> None:
+        """Set model parameters from a list of NumPy arrays."""
         if parameters:
             positions_to_keep = parameters[0]
             self.update_model(positions_to_keep)
@@ -156,6 +161,11 @@ class GaussianFlowerClient(NumPyClient):
     def filter_splats(self, mask):
         for key in self.splats:
             self.splats[key] = self.splats[key][mask]
+
+        # Also filter running_stats accordingly
+        per_splat_stats = ["grad2d", "count", "sqrgrad"]
+        for key in per_splat_stats:
+            self.running_stats[key] = self.running_stats[key][mask]
 
     def train(self, round):
         self.setup_directories(round)
@@ -366,7 +376,6 @@ class GaussianFlowerClient(NumPyClient):
             # update running stats for prunning & growing
             if step < self.cfg.refine_stop_iter:
                 self.update_running_stats(info)
-
                 if step > self.cfg.refine_start_iter and step % self.cfg.refine_every == 0:
                     grads = self.running_stats["grad2d"] / self.running_stats[
                         "count"
@@ -695,41 +704,6 @@ class GaussianFlowerClient(NumPyClient):
                     v_new
                 )  # the new ones are assumed to have high utilization in the start
             self.running_stats[k] = torch.cat((v[rest], v_new))
-        torch.cuda.empty_cache()
-
-    @torch.no_grad()
-    def refine_duplicate(self, mask: Tensor):
-        """Unility function to duplicate GSs."""
-        sel = torch.where(mask)[0]
-        for optimizer in self.optimizers:
-            for i, param_group in enumerate(optimizer.param_groups):
-                p = param_group["params"][0]
-                name = param_group["name"]
-                p_state = optimizer.state[p]
-                del optimizer.state[p]
-                for key in p_state.keys():
-                    if key != "step":
-                        # new params are assigned with zero optimizer states
-                        # (worth investigating it as it will lead to a lot more GS.)
-                        v = p_state[key]
-                        v_new = torch.zeros(
-                            (len(sel), *v.shape[1:]), device=self.device
-                        )
-                        # v_new = v[sel]
-                        p_state[key] = torch.cat([v, v_new])
-                p_new = torch.nn.Parameter(torch.cat([p, p[sel]]))
-                optimizer.param_groups[i]["params"] = [p_new]
-                optimizer.state[p_new] = p_state
-                self.splats[name] = p_new
-        for k, v in self.running_stats.items():
-            if k.find("err") != -1:
-                continue
-            if k == "sqrgrad":
-                self.running_stats[k] = torch.cat(
-                    (v, torch.ones_like(v[sel]))
-                )  # new ones are assumed to have high utilization
-            else:
-                self.running_stats[k] = torch.cat((v, v[sel]))
         torch.cuda.empty_cache()
 
     @torch.no_grad()

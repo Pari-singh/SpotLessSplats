@@ -1,7 +1,8 @@
 import os
-
+from collections import defaultdict
 import flwr
 from flwr.server.client_proxy import ClientProxy
+from flwr.server.client_manager import ClientManager
 from flwr.common import (
     Metrics,
     EvaluateIns,
@@ -15,7 +16,7 @@ from flwr.common import (
     ndarrays_to_parameters,
     parameters_to_ndarrays,
 )
-
+import open3d as o3d
 import numpy as np
 from typing import Callable, Union, Dict, List, Optional, Tuple
 from collections import OrderedDict
@@ -61,33 +62,55 @@ def weighted_average(metrics_list):
 
     return aggregated_metrics
 class SaveModelStrategy(flwr.server.strategy.FedAvg):
-    def aggregate_fit(
-            self,
-            server_round: int,
-            results: List[Tuple[flwr.server.client_proxy.ClientProxy, flwr.common.FitRes]],
-            failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
-    ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
-        """Aggregate model weights using weighted average and store checkpoint"""
+    def __init__(self, cfg, **kwargs):
+        super().__init__(**kwargs)
+        self.cfg = cfg
 
+    def aggregate_fit(
+        self,
+        server_round: int,
+        results: List[Tuple[ClientProxy, FitRes]],
+        failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+    ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
         if failures:
             print(f"Round {server_round} had failures: {failures}")
 
-        # Collect positions from all clients
-        positions_list = [parameters[0] for _, parameters, _, _ in results]
+        # Extract positions lists from clients
+        positions_list = [
+            parameters_to_ndarrays(fit_res.parameters)[0]  # Assuming each client sends one array
+            for client_proxy, fit_res in results
+        ]
+
+        if not positions_list:
+            print("positions_list is empty.")
+            return None, {}
 
         # Identify common positions
         positions_to_keep = self.identify_common_positions(positions_list)
 
-        # Send back positions to keep to all clients
-        return [positions_to_keep], {}
+        # Ensure positions_to_keep is a NumPy array
+        if not isinstance(positions_to_keep, np.ndarray):
+            print("positions_to_keep is not a NumPy array. Converting.")
+            positions_to_keep = np.array(positions_to_keep)
+
+        # Convert positions_to_keep to Parameters object
+        aggregated_parameters = ndarrays_to_parameters([positions_to_keep])
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(positions_to_keep)
+        # Saving positions as ply
+        server_path = os.path.join(self.cfg.result_dir, "server")
+        os.makedirs(server_path, exist_ok=True)
+        o3d.io.write_point_cloud(f"{server_path}/round_{server_round + (self.cfg.resume_round - 1)}.ply", pcd)
+        return aggregated_parameters, {}
 
     def identify_common_positions(self, positions_list):
         num_clients = len(positions_list)
         tolerance = 1e-5  # Adjust as needed
-        desired_num_voxels_per_axis = 50  # Adjust based on desired resolution
+        desired_num_voxels_per_axis = 5000 #50  # Adjust based on desired resolution
 
         # Compute dynamic voxel size
         all_positions = np.vstack(positions_list)
+
         min_coords = np.min(all_positions, axis=0)
         max_coords = np.max(all_positions, axis=0)
         bbox_size = max_coords - min_coords
@@ -95,43 +118,35 @@ class SaveModelStrategy(flwr.server.strategy.FedAvg):
         voxel_size = np.mean(voxel_size)
 
         # Prepare data structures
-        voxel_positions = defaultdict(lambda: defaultdict(list))  # {voxel_idx: {client_id: [positions]}}
+        voxel_positions = defaultdict(set)  # {voxel_idx: set of client_ids}
 
         # Populate voxel_positions
         for client_id, positions in enumerate(positions_list):
             for pos in positions:
                 voxel_idx = tuple(np.floor_divide(pos, voxel_size).astype(int))
-                voxel_positions[voxel_idx][client_id].append(pos)
+                voxel_positions[voxel_idx].add(client_id)
 
-        # Identify positions to keep for each client
-        client_positions_to_keep = {client_id: [] for client_id in range(len(positions_list))}
+        # Identify voxels where all clients have positions
+        common_voxels = [voxel_idx for voxel_idx, clients in voxel_positions.items() if len(clients) == num_clients]
 
-        for voxel_idx, client_pos_dict in voxel_positions.items():
-            # Only consider voxels where all clients have positions
-            if len(client_pos_dict) == num_clients:
-                # For each client, collect positions in this voxel
-                positions_per_client = {cid: np.array(pos_list) for cid, pos_list in client_pos_dict.items()}
-                # For each client, identify positions that have matches in other clients
-                for client_id in positions_list.keys():
-                    own_positions = positions_per_client[client_id]
-                    other_clients = [cid for cid in range(len(positions_list)) if cid != client_id]
-                    # For each of own positions, check if there's a matching position in other clients
-                    for pos in own_positions:
-                        match = True
-                        for other_client_id in other_clients:
-                            other_positions = positions_per_client[other_client_id]
-                            distances = np.linalg.norm(other_positions - pos, axis=1)
-                            if not np.any(distances <= tolerance):
-                                match = False
-                                break
-                        if match:
-                            client_positions_to_keep[client_id].append(pos)
+        # Collect positions in common voxels
+        print("Collecting positions in common voxels")
+        positions_to_keep = []
+        for voxel_idx in common_voxels:
+            # Collect positions from all clients in this voxel
+            voxel_positions_list = []
+            for client_id, positions in enumerate(positions_list):
+                for pos in positions:
+                    pos_voxel_idx = tuple(np.floor_divide(pos, voxel_size).astype(int))
+                    if pos_voxel_idx == voxel_idx:
+                        voxel_positions_list.append(pos)
+            # Optionally, compute the mean position or pick one representative
+            avg_position = np.mean(voxel_positions_list, axis=0)
+            positions_to_keep.append(avg_position)
 
-            # Convert lists to numpy arrays
-        for client_id in client_positions_to_keep:
-            client_positions_to_keep[client_id] = np.array(client_positions_to_keep[client_id])
-
-        return client_positions_to_keep
+        positions_to_keep = np.array(positions_to_keep)
+        print(f"positions_to_keep shape: {positions_to_keep.shape}")
+        return positions_to_keep
 
 
 def fit_config(server_round: int) -> Dict[str, Scalar]:
@@ -157,6 +172,7 @@ def choose_strategy(cfg, fit_config, weighted_average,
             on_evaluate_config_fn=on_evaluate_config,
             evaluate_metrics_aggregation_fn=weighted_average,
             evaluate_fn=get_evaluate_fn(),
+            cfg=cfg,
         )
     else:
         print("Initial Parameters given")
@@ -171,7 +187,8 @@ def choose_strategy(cfg, fit_config, weighted_average,
             on_fit_config_fn=fit_config,
             evaluate_metrics_aggregation_fn=weighted_average,
             evaluate_fn=get_evaluate_fn(),
-            initial_parameters=flwr.common.ndarrays_to_parameters(server_model_static_params)
+            initial_parameters=flwr.common.ndarrays_to_parameters(server_model_static_params),
+            cfg=cfg
         )
 
     return strategy
