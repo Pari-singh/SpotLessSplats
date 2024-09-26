@@ -37,7 +37,7 @@ class GaussianFlowerClient(NumPyClient):
         self.trainset = trainset
         self.valloader = valloader
         self.device = device
-        self.tolerance = 0.5  #Adjust this - hyperparam
+        self.voxel_size = 0.5  #Adjust this - hyperparam
 
         self.client_result_dir = os.path.join(self.cfg.result_dir, f"client_{self.client_id}")
         os.makedirs(self.client_result_dir, exist_ok=True)
@@ -92,17 +92,17 @@ class GaussianFlowerClient(NumPyClient):
 
         return gaussian_positions
 
-    def set_parameters(self, parameters: List[np.ndarray], voxel_size) -> None:
+    def set_parameters(self, parameters: List[np.ndarray]) -> None:
         """Set model parameters from a list of NumPy arrays."""
         if parameters:
             positions_to_keep = parameters[0]
-            self.update_model(positions_to_keep, voxel_size)
+            self.update_model(positions_to_keep)
 
     def fit(self, parameters, config):
         round_id = config.get('round', -1)
-        voxel_size = config.get("voxel_size", 0.0)
+        self.voxel_size = config.get("voxel_size", self.voxel_size)
 
-        self.set_parameters(parameters, voxel_size)
+        self.set_parameters(parameters)
         print("Starting client training; info from server: ", config)
 
         self.train(round_id)
@@ -132,19 +132,19 @@ class GaussianFlowerClient(NumPyClient):
         positions = gaussians_pos.detach().cpu().numpy()
         return positions
 
-    def update_model(self, positions_to_keep, voxel_size=0.0):
+    def update_model(self, positions_to_keep):
         positions_to_keep = torch.tensor(positions_to_keep, device=self.device) # Convert positions to torch tensor
 
         # Update model's splats by keeping only the positions that match
         # Get the current positions
         current_positions = self.splats['means3d']  # Shape: (N, 3)
         # For each current position, check if it's in positions_to_keep within a tolerance
-        mask = self.get_positions_mask(current_positions, positions_to_keep, voxel_size)
+        mask = self.get_positions_mask(current_positions, positions_to_keep)
 
         # Keep only the splats whose positions are in positions_to_keep
         self.filter_splats(mask)
 
-    def get_positions_mask(self, current_positions, positions_to_keep, voxel_size=0.0):
+    def get_positions_mask(self, current_positions, positions_to_keep):
         """
         Args:
             current_positions: Tensor of shape (N, 3)
@@ -157,9 +157,11 @@ class GaussianFlowerClient(NumPyClient):
         distances = torch.cdist(current_positions, positions_to_keep)
         # For each current position, check if there's any position to keep within the tolerance
         min_distances, _ = torch.min(distances, dim=1)
-        if voxel_size>0.0:
-            self.tolerance = voxel_size
-        mask = min_distances <= self.tolerance
+        if self.voxel_size>0.0:
+            tolerance = self.voxel_size # or half of it
+        else:
+            tolerance = 0.5
+        mask = min_distances <= tolerance
         return mask
 
     def filter_splats(self, mask):
