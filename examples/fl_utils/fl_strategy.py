@@ -93,7 +93,7 @@ class SaveModelStrategy(flwr.server.strategy.FedAvg):
             client_positions = parameters_to_ndarrays(fit_res.parameters)[0]
             per_client_positions[client_id] = client_positions
 
-        per_client_processed_positions = self.process_per_client_positions(per_client_positions)
+        per_client_processed_positions = self.process_per_client_positions(per_client_positions, self.cfg.num_voxels_per_axis)
 
         # Save per-client positions to files
         self.save_per_client_positions(per_client_processed_positions, server_round)
