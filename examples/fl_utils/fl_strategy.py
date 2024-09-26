@@ -1,4 +1,5 @@
 import os
+import pdb
 from collections import defaultdict
 import flwr
 from flwr.server.client_proxy import ClientProxy
@@ -86,7 +87,7 @@ class SaveModelStrategy(flwr.server.strategy.FedAvg):
             return None, {}
 
         # Identify common positions
-        positions_to_keep = self.identify_common_positions(positions_list)
+        positions_to_keep, voxel_size = self.identify_common_positions(positions_list, self.cfg.num_voxels_per_axis)
 
         # Ensure positions_to_keep is a NumPy array
         if not isinstance(positions_to_keep, np.ndarray):
@@ -101,12 +102,16 @@ class SaveModelStrategy(flwr.server.strategy.FedAvg):
         server_path = os.path.join(self.cfg.result_dir, "server")
         os.makedirs(server_path, exist_ok=True)
         o3d.io.write_point_cloud(f"{server_path}/round_{server_round + (self.cfg.resume_round - 1)}.ply", pcd)
-        return aggregated_parameters, {}
+        # Prepare the config dictionary
+        config = {
+            "voxel_size": voxel_size  # Ensure voxel_size is a scalar or serialized appropriately
+        }
+        return aggregated_parameters, config
 
-    def identify_common_positions(self, positions_list):
+    def identify_common_positions(self, positions_list, num_voxels):
         num_clients = len(positions_list)
         tolerance = 1e-5  # Adjust as needed
-        desired_num_voxels_per_axis = 5000 #50  # Adjust based on desired resolution
+        desired_num_voxels_per_axis = num_voxels #50  # Adjust based on desired resolution
 
         # Compute dynamic voxel size
         all_positions = np.vstack(positions_list)
@@ -115,6 +120,7 @@ class SaveModelStrategy(flwr.server.strategy.FedAvg):
         max_coords = np.max(all_positions, axis=0)
         bbox_size = max_coords - min_coords
         voxel_size = bbox_size / desired_num_voxels_per_axis
+        print("box_size and voxel_size ", bbox_size, voxel_size)
         voxel_size = np.mean(voxel_size)
 
         # Prepare data structures
@@ -146,7 +152,7 @@ class SaveModelStrategy(flwr.server.strategy.FedAvg):
 
         positions_to_keep = np.array(positions_to_keep)
         print(f"positions_to_keep shape: {positions_to_keep.shape}")
-        return positions_to_keep
+        return positions_to_keep, voxel_size
 
 
 def fit_config(server_round: int) -> Dict[str, Scalar]:
