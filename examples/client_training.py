@@ -106,7 +106,7 @@ class GaussianFlowerClient(NumPyClient):
         print("Starting client training; info from server: ", config)
 
         self.current_round = config.get('round', 0)
-        self.train(self.current_round)
+        self.train()
         new_parameters = self.get_parameters()
         return new_parameters, len(self.trainset), {}
 
