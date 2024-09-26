@@ -37,6 +37,7 @@ class GaussianFlowerClient(NumPyClient):
         self.trainset = trainset
         self.valloader = valloader
         self.device = device
+        self.current_round = 0
         self.tolerance = 1e-5  #Adjust this - hyperparam
 
         self.client_result_dir = os.path.join(self.cfg.result_dir, f"client_{self.client_id}")
@@ -94,23 +95,25 @@ class GaussianFlowerClient(NumPyClient):
 
     def set_parameters(self, parameters: List[np.ndarray]) -> None:
         """Set model parameters from a list of NumPy arrays."""
-        if parameters:
-            positions_to_keep = parameters[0]
-            self.update_model(positions_to_keep)
+        positions = self.load_positions_from_file()
+        if positions is not None:
+            self.update_model(positions)
+        else:
+            print(f"Client {self.client_id} could not find positions file.")
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
         print("Starting client training; info from server: ", config)
 
-        round_id = config.get('round', -1)
-        self.train(round_id)
+        self.current_round = config.get('round', 0)
+        self.train(self.current_round)
         new_parameters = self.get_parameters()
         return new_parameters, len(self.trainset), {}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
-        round_id = config.get('round', -1)
-        metrics = self.eval(round=round_id, return_metric=True)
+        self.current_round = config.get('round', -1)
+        metrics = self.eval(return_metric=True)
         psnr = metrics['PSNR'].item() if 'PSNR' in metrics else 0.0
         ssim = metrics['SSIM'].item() if 'SSIM' in metrics else 0.0
         lpips = metrics['LPIPS'].item() if 'LPIPS' in metrics else 0.0
@@ -129,6 +132,18 @@ class GaussianFlowerClient(NumPyClient):
         gaussians_pos = self.splats['means3d']  # Shape: (N, 3)
         positions = gaussians_pos.detach().cpu().numpy()
         return positions
+
+    def load_positions_from_file(self):
+        import os
+        filename = os.path.join(self.cfg.result_dir, f"round_{self.current_round}",
+                                f"client_{self.client_id}_positions.npy")
+        if os.path.exists(filename):
+            positions = np.load(filename)
+            print(f"Client {self.client_id} loaded positions from {filename}")
+            return positions
+        else:
+            print(f"Positions file {filename} not found.")
+            return None
 
     def update_model(self, positions_to_keep):
         positions_to_keep = torch.tensor(positions_to_keep, device=self.device) # Convert positions to torch tensor
@@ -167,7 +182,8 @@ class GaussianFlowerClient(NumPyClient):
         for key in per_splat_stats:
             self.running_stats[key] = self.running_stats[key][mask]
 
-    def train(self, round):
+    def train(self):
+        round = self.current_round
         self.setup_directories(round)
         with open(f"{self.client_result_dir}/{round}/cfg.json", "w") as f:
             json.dump(vars(self.cfg), f)
@@ -196,9 +212,6 @@ class GaussianFlowerClient(NumPyClient):
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
-        # Wrap the training loop with the profiler
-        # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True,
-        #              record_shapes=True) as prof:
         for step in pbar:
             if not self.cfg.disable_viewer:
                 while self.runner.viewer.state.status == "paused":
@@ -452,16 +465,9 @@ class GaussianFlowerClient(NumPyClient):
                         is_coalesced=len(Ks) == 1,
                     )
             print(self.ckpt_dir)
-            # optimize
             for optimizer in self.optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            # for optimizer in self.pose_optimizers:
-            #     optimizer.step()
-            #     optimizer.zero_grad(set_to_none=True)
-            # for optimizer in self.app_optimizers:
-            #     optimizer.step()
-            #     optimizer.zero_grad(set_to_none=True)
             for optimizer in self.spotless_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -509,7 +515,7 @@ class GaussianFlowerClient(NumPyClient):
 
             # eval the full set at the end of entire training
             if step in [i - 1 for i in self.cfg.eval_steps] or step == max_steps - 1:
-                self.eval(step, round)
+                self.eval(step)
                 # self.render_traj(step, round)
 
             # Experimental - memory efficiency optimization
@@ -532,12 +538,13 @@ class GaussianFlowerClient(NumPyClient):
             # print(prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
 
     @torch.no_grad()
-    def eval(self, step: int=0, round: int=0, return_metric: bool=False):
+    def eval(self, step: int=0, return_metric: bool=False):
         """Entry for evaluation."""
-        print("Running evaluation for round: ", round)
-        self.setup_directories(round)
         cfg = self.cfg
         device = self.device
+        round = self.current_round
+        print("Running evaluation for round: ", round)
+        self.setup_directories(round)
 
         ellipse_time = 0
         metrics = {"psnr": [], "ssim": [], "lpips": []}
@@ -564,9 +571,14 @@ class GaussianFlowerClient(NumPyClient):
 
             # write images
             canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
-            imageio.imwrite(
-                f"{self.render_dir}/val_{i:04d}.png", (canvas * 255).astype(np.uint8)
-            )
+            if not return_metric:
+                imageio.imwrite(
+                    f"{self.render_dir}/val_{i:04d}.png", (canvas * 255).astype(np.uint8)
+                )
+            else:
+                imageio.imwrite(
+                    f"{self.render_dir}/test_{i:04d}.png", (canvas * 255).astype(np.uint8)
+                )
 
             pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
             colors = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]

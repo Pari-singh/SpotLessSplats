@@ -86,67 +86,96 @@ class SaveModelStrategy(flwr.server.strategy.FedAvg):
             return None, {}
 
         # Identify common positions
-        positions_to_keep = self.identify_common_positions(positions_list)
+        per_client_positions = {}  # {client_id: positions}
 
-        # Ensure positions_to_keep is a NumPy array
-        if not isinstance(positions_to_keep, np.ndarray):
-            print("positions_to_keep is not a NumPy array. Converting.")
-            positions_to_keep = np.array(positions_to_keep)
+        for client_proxy, fit_res in results:
+            client_id = client_proxy.cid  # Assuming cid is the client ID
+            client_positions = parameters_to_ndarrays(fit_res.parameters)[0]
+            per_client_positions[client_id] = client_positions
 
-        # Convert positions_to_keep to Parameters object
-        aggregated_parameters = ndarrays_to_parameters([positions_to_keep])
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(positions_to_keep)
-        # Saving positions as ply
-        server_path = os.path.join(self.cfg.result_dir, "server")
-        os.makedirs(server_path, exist_ok=True)
-        o3d.io.write_point_cloud(f"{server_path}/round_{server_round + (self.cfg.resume_round - 1)}.ply", pcd)
-        return aggregated_parameters, {}
+        per_client_processed_positions = self.process_per_client_positions(per_client_positions)
 
-    def identify_common_positions(self, positions_list):
-        num_clients = len(positions_list)
-        tolerance = 1e-5  # Adjust as needed
-        desired_num_voxels_per_axis = 5000 #50  # Adjust based on desired resolution
+        # Save per-client positions to files
+        self.save_per_client_positions(per_client_processed_positions, server_round)
+        return None, {}
 
-        # Compute dynamic voxel size
-        all_positions = np.vstack(positions_list)
+    def process_per_client_positions(self, per_client_positions: Dict[str, np.ndarray], num_voxels: int) -> Dict[str, np.ndarray]:
+        """
+            Processes per-client positions to identify common voxels where all clients have positions.
 
+            Args:
+                per_client_positions (Dict[str, np.ndarray]): Dictionary mapping client IDs to their positions.
+                num_voxels (int) : Desired_num_voxels
+            Returns:
+                Dict[str, np.ndarray]: Dictionary mapping client IDs to their processed positions in common voxels.
+            """
+        num_clients = len(per_client_positions)
+        positions_list = list(per_client_positions.values())
+        client_ids = list(per_client_positions.keys())
+
+        # Stack all positions vertically to compute overall min and max coordinates
+        all_positions = np.vstack(positions_list)  # Shape: (total_num_positions, 3)
+        print(f"All positions shape: {all_positions.shape}")
+
+        desired_num_voxels_per_axis = num_voxels
         min_coords = np.min(all_positions, axis=0)
         max_coords = np.max(all_positions, axis=0)
         bbox_size = max_coords - min_coords
-        voxel_size = bbox_size / desired_num_voxels_per_axis
-        voxel_size = np.mean(voxel_size)
 
-        # Prepare data structures
-        voxel_positions = defaultdict(set)  # {voxel_idx: set of client_ids}
+        # Handle case where bbox_size is zero (all points are at the same coordinate)
+        voxel_size_per_axis = bbox_size / desired_num_voxels_per_axis
+        voxel_size = np.mean(voxel_size_per_axis)
+        if voxel_size == 0:
+            voxel_size = 1e-6  # Small number to prevent division by zero
+        print(f"Voxel size: {voxel_size}")
 
-        # Populate voxel_positions
-        for client_id, positions in enumerate(positions_list):
-            for pos in positions:
-                voxel_idx = tuple(np.floor_divide(pos, voxel_size).astype(int))
-                voxel_positions[voxel_idx].add(client_id)
+        # Create a mapping from voxel index to clients present and positions per client
+        voxel_dict = {}  # {voxel_idx: {'clients': set of client_ids, 'positions': {client_id: [positions]}}}
+
+        for client_id, positions in per_client_positions.items():
+            # Shift positions by min_coords to ensure all positions are positive
+            shifted_positions = positions - min_coords
+            # Compute voxel indices
+            voxel_indices = np.floor_divide(shifted_positions, voxel_size).astype(int)
+            for idx, voxel_idx in enumerate(map(tuple, voxel_indices)):
+                if voxel_idx not in voxel_dict:
+                    voxel_dict[voxel_idx] = {'clients': set(), 'positions': defaultdict(list)}
+                voxel_dict[voxel_idx]['clients'].add(client_id)
+                # Store the original position (not shifted)
+                voxel_dict[voxel_idx]['positions'][client_id].append(positions[idx])
 
         # Identify voxels where all clients have positions
-        common_voxels = [voxel_idx for voxel_idx, clients in voxel_positions.items() if len(clients) == num_clients]
+        common_voxels = [voxel_idx for voxel_idx, data in voxel_dict.items() if len(data['clients']) == num_clients]
+        print(f"Number of common voxels: {len(common_voxels)}")
 
-        # Collect positions in common voxels
-        print("Collecting positions in common voxels")
-        positions_to_keep = []
+        # For each client, collect their positions in the common voxels
+        per_client_processed_positions = {client_id: [] for client_id in client_ids}
+
         for voxel_idx in common_voxels:
-            # Collect positions from all clients in this voxel
-            voxel_positions_list = []
-            for client_id, positions in enumerate(positions_list):
-                for pos in positions:
-                    pos_voxel_idx = tuple(np.floor_divide(pos, voxel_size).astype(int))
-                    if pos_voxel_idx == voxel_idx:
-                        voxel_positions_list.append(pos)
-            # Optionally, compute the mean position or pick one representative
-            avg_position = np.mean(voxel_positions_list, axis=0)
-            positions_to_keep.append(avg_position)
+            data = voxel_dict[voxel_idx]
+            # For each client, collect their positions in this voxel
+            for client_id in client_ids:
+                positions_in_voxel = data['positions'][client_id]
+                per_client_processed_positions[client_id].extend(positions_in_voxel)
 
-        positions_to_keep = np.array(positions_to_keep)
-        print(f"positions_to_keep shape: {positions_to_keep.shape}")
-        return positions_to_keep
+        # Convert lists to numpy arrays
+        for client_id in per_client_processed_positions:
+            positions = per_client_processed_positions[client_id]
+            per_client_processed_positions[client_id] = np.array(positions) if positions else np.empty((0, 3))
+            print(f"Client {client_id} has {len(positions)} positions in common voxels.")
+
+        return per_client_processed_positions
+
+
+    def save_per_client_positions(self, per_client_positions: Dict[str, np.ndarray], server_round: int):
+        import os
+        output_dir = self.cfg.result_dir  # Assuming cfg has result_dir attribute
+        os.makedirs(output_dir, exist_ok=True)
+
+        for client_id, positions in per_client_positions.items():
+            filename = os.path.join(output_dir, f"client_{client_id}_positions_round_{server_round}.npy")
+            np.save(filename, positions)
+            print(f"Saved positions for client {client_id} to {filename}")
 
 
 def fit_config(server_round: int) -> Dict[str, Scalar]:

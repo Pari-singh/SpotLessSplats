@@ -184,11 +184,12 @@ class Config:
     mlp_spotless_num_feats: int = 0
 
     # Federated Strategy config
-    fraction_fit = 1.0
-    fraction_evaluate = 0.1
-    min_fit_clients = 1
-    min_evaluate_clients = 1
-    min_available_clients = 1
+    fraction_fit: float = 1.0
+    fraction_evaluate: float = 0.1
+    min_fit_clients: int = 1
+    min_evaluate_clients: int = 1
+    min_available_clients: int = 1
+    num_voxels_per_axis: int = 50
 
 
 
