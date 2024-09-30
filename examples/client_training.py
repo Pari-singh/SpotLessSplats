@@ -38,7 +38,7 @@ class GaussianFlowerClient(NumPyClient):
         self.valloader = valloader
         self.device = device
         self.current_round = 0
-        self.tolerance = 1e-5  #Adjust this - hyperparam
+        self.tolerance = 1e-3  #Adjust this - hyperparam
 
         self.client_result_dir = os.path.join(self.cfg.result_dir, f"client_{self.client_id}")
         os.makedirs(self.client_result_dir, exist_ok=True)
@@ -152,10 +152,35 @@ class GaussianFlowerClient(NumPyClient):
         # Get the current positions
         current_positions = self.splats['means3d']  # Shape: (N, 3)
         # For each current position, check if it's in positions_to_keep within a tolerance
-        mask = self.get_positions_mask(current_positions, positions_to_keep)
+        mask = self.get_positions_mask_using_mapping(current_positions, positions_to_keep, quant_factor=1e-3)
 
         # Keep only the splats whose positions are in positions_to_keep
         self.filter_splats(mask)
+        self.save_splats_as_pth()
+
+    def get_positions_mask_using_mapping(self, current_positions, positions_to_keep, quant_factor):
+        current_positions_q = self.quantize_positions(current_positions, quant_factor)
+        positions_to_keep_q = self.quantize_positions(positions_to_keep, quant_factor)
+        positions_to_keep_set = set([tuple(pos.tolist()) for pos in positions_to_keep_q])
+        mask = torch.tensor(
+            [tuple(pos.tolist()) in positions_to_keep_set for pos in current_positions_q],
+            device=current_positions.device
+        )
+        return mask
+
+    def quantize_positions(self, positions, quant_factor):
+        return (positions / quant_factor).round().long()
+    def save_splats_as_pth(self):
+        # Create a dictionary of splats to save
+        splats_to_save = {key: self.splats[key].cpu() for key in self.splats}
+        # Define the file path
+        filename = os.path.join(self.cfg.result_dir, f"round_{self.current_round}",
+                                f"client_{self.client_id}_splats_pruned.pth")
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        # Save the splats
+        torch.save(splats_to_save, filename)
+        print(f"Client {self.client_id}: Saved splats to {filename}")
 
     def get_positions_mask(self, current_positions, positions_to_keep):
         """
