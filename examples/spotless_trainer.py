@@ -39,6 +39,8 @@ class Config:
     disable_viewer: bool = False
     # Path to the .pt file. If provide, it will skip training and render a video
     ckpt: Optional[str] = None
+    # Path to the .pt file. With this, the splats, runner and optimizers won't be initialized randomly
+    ckpt_train: Optional[str] = None
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
@@ -174,6 +176,9 @@ class Config:
     tb_every: int = 100
     # Save training images to tensorboard
     tb_save_image: bool = False
+    client_id: int = 0
+    round: int = 1
+    client_split_path: str = None
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -199,44 +204,67 @@ def create_splats_with_optimizers(
     batch_size: int = 1,
     feature_dim: Optional[int] = None,
     device: str = "cuda",
+    ckpt_train: str = None,
 ) -> Tuple[torch.nn.ParameterDict, torch.optim.Optimizer]:
-    if init_type == "sfm":
-        points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-    elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-        rgbs = torch.rand((init_num_pts, 3))
+    if ckpt_train:
+        print("loading splats and optimizers from existing ckpt ", ckpt_train)
+        checkpoint = torch.load(cfg.ckpt_train)
+        # Load splats
+        old_splats = checkpoint['splats']
+        points = old_splats['means3d']
+        opacities = old_splats['opacities']
+        scales = old_splats['scales']
+        quats = old_splats['quats']
+        sh0 = old_splats['sh0']
+        shN = old_splats['shN']
+        params = [
+            # name, value, lr
+            ("means3d", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
+            ("scales", torch.nn.Parameter(scales), 5e-3),
+            ("quats", torch.nn.Parameter(quats), 1e-3),
+            ("opacities", torch.nn.Parameter(opacities), 5e-2),
+            ("sh0", torch.nn.Parameter(sh0), 2.5e-3),
+            ("shN", torch.nn.Parameter(shN), 2.5e-3 / 20)
+        ]
+
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        if init_type == "sfm":
+            points = torch.from_numpy(parser.points).float()
+            rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        elif init_type == "random":
+            points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+            rgbs = torch.rand((init_num_pts, 3))
+        else:
+            raise ValueError("Please specify a correct init_type: sfm or random")
 
-    N = points.shape[0]
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+        N = points.shape[0]
+        # Initialize the GS size to be the average dist of the 3 nearest neighbors
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+        quats = torch.rand((N, 4))  # [N, 4]
+        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
-    params = [
-        # name, value, lr
-        ("means3d", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
-        ("scales", torch.nn.Parameter(scales), 5e-3),
-        ("quats", torch.nn.Parameter(quats), 1e-3),
-        ("opacities", torch.nn.Parameter(opacities), 5e-2),
-    ]
+        params = [
+            # name, value, lr
+            ("means3d", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
+            ("scales", torch.nn.Parameter(scales), 5e-3),
+            ("quats", torch.nn.Parameter(quats), 1e-3),
+            ("opacities", torch.nn.Parameter(opacities), 5e-2),
+        ]
 
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), 2.5e-3))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
+        if feature_dim is None:
+            # color is SH coefficients.
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+            colors[:, 0, :] = rgb_to_sh(rgbs)
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
+        else:
+            # features will be used for appearance and view-dependent shading
+            features = torch.rand(N, feature_dim)  # [N, feature_dim]
+            params.append(("features", torch.nn.Parameter(features), 2.5e-3))
+            colors = torch.logit(rgbs)  # [N, 3]
+            params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -253,6 +281,28 @@ def create_splats_with_optimizers(
     ]
     return splats, optimizers
 
+def load_client_splits(split_path):
+    import pandas as pd
+    from pathlib import Path
+    extension = Path(split_path).suffix
+    if extension == ".csv":
+        client_splits = pd.read_csv(split_path, index_col=None, header=0)
+    else:
+        client_splits = pd.read_csv(split_path, sep='\t')
+    client_images = {}
+    for index, row in client_splits.iterrows():
+        client_id = row['client_id']
+        image_names = row['image_names']
+        if client_id in client_images:
+            client_images[client_id].append(image_names)
+        else:
+            client_images[client_id] = [image_names]
+    return client_images
+
+def map_image_names_to_indices(dataset_parser, image_names):
+    name_to_index = {name: i for i, name in enumerate(dataset_parser.image_names)}
+    indices = [name_to_index[name] for name in image_names if name in name_to_index]
+    return indices
 
 class Runner:
     """Engine for training and testing."""
@@ -267,15 +317,19 @@ class Runner:
         os.makedirs(cfg.result_dir, exist_ok=True)
 
         # Setup output directories.
-        self.ckpt_dir = f"{cfg.result_dir}/ckpts"
+        self.client_result_dir = f"{cfg.result_dir}/client_{cfg.client_id}"
+        os.makedirs(self.client_result_dir, exist_ok=True)
+        self.ckpt_dir = f"{self.client_result_dir}/{cfg.round}/ckpts"
         os.makedirs(self.ckpt_dir, exist_ok=True)
-        self.stats_dir = f"{cfg.result_dir}/stats"
+        self.stats_dir = f"{self.client_result_dir}/{cfg.round}/stats"
         os.makedirs(self.stats_dir, exist_ok=True)
-        self.render_dir = f"{cfg.result_dir}/renders"
+        self.render_dir = f"{self.client_result_dir}/{cfg.round}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
 
         # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
+        self.writer = SummaryWriter(log_dir=f"{self.client_result_dir}/{cfg.round}/tb")
+        # load the split from tsv file
+        self.client_splits = load_client_splits(cfg.client_split_path)
 
         # Load data: Training data should contain initial points and colors.
         if cfg.semantics:
@@ -293,6 +347,9 @@ class Runner:
                 normalize=cfg.normalize,
                 test_every=cfg.test_every,
             )
+        # import pdb; pdb.set_trace()
+        image_names = self.client_splits[cfg.client_id]
+        indices = map_image_names_to_indices(self.parser, image_names)
         self.trainset = ClutterDataset(
             self.parser,
             split="train",
@@ -301,6 +358,7 @@ class Runner:
             train_keyword=cfg.train_keyword,
             test_keyword=cfg.test_keyword,
             semantics=cfg.semantics,
+            client_indices=indices
         )
         self.valset = ClutterDataset(
             self.parser,
@@ -327,6 +385,7 @@ class Runner:
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
             device=self.device,
+            ckpt_train=cfg.ckpt_train
         )
         print("Model initialized. Number of GS:", len(self.splats["means3d"]))
 
@@ -501,8 +560,10 @@ class Runner:
         cfg = self.cfg
         device = self.device
 
+        print(
+            f"Starting training for client {cfg.client_id}, round{cfg.round} with {len(self.splats['means3d'])} positions")
         # Dump cfg.
-        with open(f"{cfg.result_dir}/cfg.json", "w") as f:
+        with open(f"{self.client_result_dir}/{cfg.round}/cfg.json", "w") as f:
             json.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
@@ -691,7 +752,7 @@ class Runner:
                 range=(0.0, 1.0),
             )[0]
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"client={cfg.client_id} | round={cfg.round} | loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -848,6 +909,8 @@ class Runner:
                     {
                         "step": step,
                         "splats": self.splats.state_dict(),
+                        "optimizers": [optimizer.state_dict() for optimizer in self.optimizers],
+                        "running_stats": {key: value for key, value in self.running_stats.items()}
                     },
                     f"{self.ckpt_dir}/ckpt_{step}.pt",
                 )
@@ -857,7 +920,7 @@ class Runner:
                 self.eval(step)
                 self.render_traj(step)
 
-            self.log_memory_usage(step, 'training')
+            # self.log_memory_usage(step, 'training')
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -1213,7 +1276,7 @@ class Runner:
             canvas_all.append(canvas)
 
         # save to video
-        video_dir = f"{cfg.result_dir}/videos"
+        video_dir = f"{self.client_result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
         writer = imageio.get_writer(f"{video_dir}/traj_{step}.gif", fps=30)
         for canvas in canvas_all:

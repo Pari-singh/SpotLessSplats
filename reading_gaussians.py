@@ -96,6 +96,82 @@ def convert_pt_to_ply(pt_file, ply_file):
     PlyData([el]).write(ply_file)
     print(f"Converted {pt_file} to {ply_file} with all required attributes including shN.")
 
+def convert_pth_to_ply(pt_file, ply_file):
+    # Load the .pt file
+    data = torch.load(pt_file)
+    splats = data
+
+    # Extract data
+    means3d = splats['means3d'].detach().numpy()            # Positions (N, 3)
+    opacities = splats['opacities'].detach()                # Opacities (N,)
+    quats = splats['quats'].detach().numpy()                # Rotations (N, 4)
+    scales = splats['scales'].detach().numpy()              # Scales (N, 3)
+    sh0 = splats['sh0'].detach().numpy()                    # sh0 features (N, 1, num_feats)
+    shN = splats['shN'].detach().numpy()                    # shN features (N, 15, num_feats)
+
+    N = means3d.shape[0]
+
+    # Set normals to zeros
+    normals = np.zeros_like(means3d)                     # Normals (N, 3)
+
+    # Flatten sh0 and shN features
+    f_dc = sh0.reshape(N, -1)                            # Flatten sh0 to (N, num_feats_sh0)
+    f_rest = shN.reshape(N, -1)                          # Flatten shN to (N, 15 * num_feats_shN)
+    print("f_dc shape:", f_dc.shape)
+    print("f_rest shape:", f_rest.shape)
+
+    # Handle opacities (apply logit function)
+    # Avoid zeros or ones to prevent infinities
+    eps = 1e-6
+    opacities = opacities.clamp(eps, 1 - eps)
+    opacities = torch.logit(opacities).cpu().numpy().reshape(-1, 1)
+    print("opacities shape after logit:", opacities.shape)
+
+    # Concatenate all attributes
+    attributes = np.concatenate(
+        (
+            means3d,        # x, y, z          (N, 3)
+            normals,        # nx, ny, nz       (N, 3)
+            f_dc,           # f_dc_0, ...      (N, num_features_sh0)
+            f_rest,         # f_rest_0, ...    (N, 15 * num_feats_shN)
+            opacities,      # opacity          (N, 1)
+            scales,         # scale_0, scale_1, scale_2 (N, 3)
+            quats           # rot_0, rot_1, rot_2, rot_3 (N, 4)
+        ),
+        axis=1
+    )
+    print("attributes shape:", attributes.shape)
+
+    # Construct list of attributes
+    def construct_list_of_attributes():
+        l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+        for i in range(f_dc.shape[1]):
+            l.append('f_dc_{}'.format(i))
+        for i in range(f_rest.shape[1]):
+            l.append('f_rest_{}'.format(i))
+        l.append('opacity')
+        for i in range(scales.shape[1]):
+            l.append('scale_{}'.format(i))
+        for i in range(quats.shape[1]):
+            l.append('rot_{}'.format(i))
+        return l
+
+    # Create the dtype for structured array
+    attribute_names = construct_list_of_attributes()
+    dtype_full = [(attribute, 'f4') for attribute in attribute_names]
+
+    # Ensure the output directory exists
+    os.makedirs(os.path.dirname(ply_file), exist_ok=True)
+
+    # Create structured array for PLY
+    elements = np.empty(N, dtype=dtype_full)
+    elements[:] = list(map(tuple, attributes))
+
+    # Write the PLY file
+    el = PlyElement.describe(elements, 'vertex')
+    PlyData([el]).write(ply_file)
+    print(f"Converted {pt_file} to {ply_file} with all required attributes including shN.")
+
 def convert_ply_to_pt(ply_file, pt_file):
     # Read the PLY file
     plydata = PlyData.read(ply_file)
@@ -167,9 +243,12 @@ def convert_ply_to_pt(ply_file, pt_file):
 
 
 if __name__=="__main__":
-    pt_file = '/media/fast_data/rice_spotless/outputs/sofa_people_central_ubp3/ckpts/ckpt_29999.pt'
-    ply_file = '/media/fast_data/rice_spotless/outputs/sofa_people_central_ubp3/ckpts/ckpt_29999.ply'
+    pt_file = 'outputs/lr_str2_2000vox_manual_tol-7/client_0/server/1/ckpt_29999.pt'
+    ply_file = 'outputs/lr_str2_2000vox_manual_tol-7/client_0/server/1/ckpt_29999.ply'
     new_ply_file = "/media/fast_data/rice_spotless/outputs/sofa_people_central_ubp3/ckpts/ckpt_29999.ply"
     new_pt_file = "/media/fast_data/rice_spotless/outputs/sofa_people_central_ubp3/ckpts/nosupersplat_ckpt_29999.pt"
-    # convert_pt_to_ply(pt_file, ply_file)
-    convert_ply_to_pt(new_ply_file, new_pt_file)
+    if pt_file.split('/')[-1].split('.')[-1]=='pt':
+        convert_pt_to_ply(pt_file, ply_file)
+    else:
+        convert_pth_to_ply(pt_file, ply_file)
+    # convert_ply_to_pt(new_ply_file, new_pt_file)
