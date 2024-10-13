@@ -32,6 +32,13 @@ from utils import (
 )
 
 from gsplat.rendering import rasterization
+from sam_mask_generation import (
+    compute_segmentation_loss,
+    aggregate_segmentation_labels,
+    assign_segmentation_labels_to_splats,
+    project_splats_to_image,
+    generate_segmentation_masks,
+)
 
 @dataclass
 class Config:
@@ -179,6 +186,8 @@ class Config:
     client_id: int = 0
     round: int = 1
     client_split_path: str = None
+    semantic_basic: str = True
+    segmentation_lambda: float = 1.0  # Weight for segmentation loss
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -265,6 +274,11 @@ def create_splats_with_optimizers(
             params.append(("features", torch.nn.Parameter(features), 2.5e-3))
             colors = torch.logit(rgbs)  # [N, 3]
             params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
+
+    if cfg.semantic_basic:
+        # Add segmentation labels
+        segmentation_labels = -1 * torch.ones(N, dtype=torch.int32)  # Initialize with -1 (unknown)
+        params.append(("segmentation", torch.nn.Parameter(segmentation_labels), 1e-3))  # Assign a learning rate
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -733,6 +747,20 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+            if cfg.semantic_basic:
+                # Generate segmentation masks using SAM
+                image = pixels.cpu().numpy()[0]  # Assuming batch size of 1
+                masks = generate_segmentation_masks(image)  # List[Dict]
+
+                # Assign segmentation labels to splats based on masks
+                assign_segmentation_labels_to_splats(self, image_idx, masks)
+
+                # Aggregate labels across all views (if applicable)
+                aggregate_segmentation_labels(self, all_image_masks)
+
+                # Compute segmentation loss
+                segmentation_loss = compute_segmentation_loss(self, runner.splats["segmentation"])
+                loss += segmentation_loss * cfg.segmentation_lambda
 
             loss.backward()
 
@@ -770,6 +798,8 @@ class Runner:
                     "train/num_GS", len(self.splats["means3d"]), step
                 )
                 self.writer.add_scalar("train/mem", mem, step)
+                if cfg.semantic_basic:
+                    self.writer.add_scalar("train/segmentation_loss", segmentation_loss.item(), step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.tb_save_image:
